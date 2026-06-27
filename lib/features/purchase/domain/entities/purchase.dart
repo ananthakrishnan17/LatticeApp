@@ -1,0 +1,480 @@
+import 'package:bloc/bloc.dart';
+import 'package:dio/dio.dart' show Options;
+import 'package:equatable/equatable.dart';
+import 'package:flutter/foundation.dart';
+import 'package:uuid/uuid.dart';
+import '../../../../core/backend/backend_api_service.dart';
+import '../../../../core/backend/backend_id_mapper.dart';
+import '../../../../core/database/database_helper.dart';
+import '../../../../core/ledger/ledger_service.dart';
+import '../../../../core/sync/data_access_mode_service.dart';
+import '../../../../core/utils/uom_conversion_helper.dart';
+
+// ─── Entities ─────────────────────────────────────────────────────────────────
+class PurchaseItem extends Equatable {
+  final int? id;
+  final int purchaseId;
+  final int productId;
+  final String productName;
+  final double quantity;
+  final String unit;
+  final double unitCost;
+  final double gstRate;
+  final double gstAmount;
+  final double totalCost;
+
+  const PurchaseItem({this.id, required this.purchaseId, required this.productId,
+    required this.productName, required this.quantity, required this.unit,
+    required this.unitCost, this.gstRate = 0, this.gstAmount = 0, required this.totalCost});
+
+  factory PurchaseItem.fromMap(Map<String, dynamic> m) => PurchaseItem(
+      id: m['id'], purchaseId: m['purchase_id'], productId: m['product_id'],
+      productName: m['product_name'], quantity: (m['quantity'] as num).toDouble(),
+      unit: m['unit'], unitCost: (m['unit_cost'] as num).toDouble(),
+      gstRate: (m['gst_rate'] as num?)?.toDouble() ?? 0,
+      gstAmount: (m['gst_amount'] as num?)?.toDouble() ?? 0,
+      totalCost: (m['total_cost'] as num).toDouble());
+
+  Map<String, dynamic> toMap() => {'purchase_id': purchaseId, 'product_id': productId,
+    'product_name': productName, 'quantity': quantity, 'unit': unit,
+    'unit_cost': unitCost, 'gst_rate': gstRate, 'gst_amount': gstAmount, 'total_cost': totalCost};
+
+  @override List<Object?> get props => [id, productId, quantity];
+}
+
+class Purchase extends Equatable {
+  final int? id;
+  final String purchaseNumber;
+  final int? supplierId;
+  final String? supplierName;
+  final List<PurchaseItem> items;
+  final double totalAmount;
+  final double gstTotal;
+  final double discountAmount;
+  final String paymentMode;
+  final String? notes;
+  final DateTime purchaseDate;
+  final DateTime createdAt;
+
+  const Purchase({this.id, required this.purchaseNumber, this.supplierId,
+    this.supplierName, required this.items, required this.totalAmount,
+    this.gstTotal = 0, this.discountAmount = 0, this.paymentMode = 'cash',
+    this.notes, required this.purchaseDate, required this.createdAt});
+
+  factory Purchase.fromMap(Map<String, dynamic> m, List<PurchaseItem> items) => Purchase(
+      id: m['id'], purchaseNumber: m['purchase_number'], supplierId: m['supplier_id'],
+      supplierName: m['supplier_name'], items: items,
+      totalAmount: (m['total_amount'] as num).toDouble(),
+      gstTotal: (m['gst_total'] as num?)?.toDouble() ?? 0,
+      discountAmount: (m['discount_amount'] as num?)?.toDouble() ?? 0,
+      paymentMode: m['payment_mode'] ?? 'cash', notes: m['notes'],
+      purchaseDate: DateTime.parse(m['purchase_date']),
+      createdAt: DateTime.parse(m['created_at']));
+
+  Map<String, dynamic> toMap() => {
+    'purchase_number': purchaseNumber, 'supplier_id': supplierId, 'supplier_name': supplierName,
+    'total_amount': totalAmount, 'gst_total': gstTotal, 'discount_amount': discountAmount,
+    'payment_mode': paymentMode, 'notes': notes,
+    'purchase_date': purchaseDate.toIso8601String(), 'created_at': createdAt.toIso8601String()};
+
+  @override List<Object?> get props => [id, purchaseNumber];
+}
+
+// ─── Cart item for purchase entry ─────────────────────────────────────────────
+class PurchaseCartItem {
+  final int productId;
+  final String productName;
+  final String unit;
+  double quantity;
+  double unitCost;
+  double gstRate;
+  // Batch tracking fields — used to create a batches row on save so that
+  // billing can apply FEFO (First Expiry First Out) during stock deduction.
+  final String? batchNumber;
+  final DateTime? expiryDate;
+
+  PurchaseCartItem({required this.productId, required this.productName,
+    required this.unit, this.quantity = 1, required this.unitCost, this.gstRate = 0,
+    this.batchNumber, this.expiryDate});
+
+  double get gstAmount => unitCost * quantity * gstRate / 100;
+  double get totalCost => unitCost * quantity + gstAmount;
+}
+
+// ─── Repository ────────────────────────────────────────────────────────────────
+class PurchaseRepository {
+  final DatabaseHelper _db;
+  static const _uuid = Uuid();
+  PurchaseRepository(this._db);
+  int _counter = 0;
+
+  Future<bool> _isOnlineMode() async =>
+      (await DataAccessModeService.instance.resolveMode()) ==
+      DataAccessMode.onlineApi;
+
+  Future<String?> _lookupUuid(String namespace, int? id) async {
+    if (id == null) return null;
+    return BackendIdMapper.instance.lookupUuid(namespace: namespace, id: id);
+  }
+
+  Future<int> _registerUuid(String namespace, String? uuid) async {
+    if (uuid == null || uuid.isEmpty) return 0;
+    return BackendIdMapper.instance.register(namespace: namespace, uuid: uuid);
+  }
+
+  String _genNumber() {
+    final now = DateTime.now();
+    _counter++;
+    return 'PUR-${now.year}${now.month.toString().padLeft(2,'0')}${now.day.toString().padLeft(2,'0')}-${_counter.toString().padLeft(3,'0')}';
+  }
+
+  Future<Purchase> savePurchase({
+    required List<PurchaseCartItem> items,
+    int? supplierId, String? supplierName,
+    String paymentMode = 'cash', String? notes,
+    double? invoiceAmount, String? invoiceNumber,
+    DateTime? purchaseDate,
+  }) async {
+    if (await _isOnlineMode()) {
+      final now = DateTime.now();
+      final date = purchaseDate ?? now;
+      final computedTotal = items.fold(0.0, (s, i) => s + i.totalCost.abs());
+      final total =
+          (invoiceAmount != null && invoiceAmount > 0) ? invoiceAmount : computedTotal;
+      final gstTotal = items.fold(0.0, (s, i) => s + i.gstAmount);
+      final purchaseNumber = _genNumber();
+      final clientRecordId = _uuid.v4();
+      await BackendApiService.instance.withAuthRetry<Map<String, dynamic>>((
+        dio,
+        headers,
+      ) async {
+        final response = await dio.post<Map<String, dynamic>>(
+          'purchases/upsert',
+          data: {
+            'clientRecordId': clientRecordId,
+            'purchaseNumber': purchaseNumber,
+            'supplierName': supplierName,
+            'totalAmount': total,
+            'gstTotal': gstTotal,
+            'paymentMode': paymentMode,
+            'invoiceNumber': invoiceNumber,
+            'invoiceAmount': invoiceAmount,
+            'notes': notes,
+            'purchaseDate': date.toUtc().toIso8601String(),
+            'createdAt': now.toUtc().toIso8601String(),
+            'updatedAt': now.toUtc().toIso8601String(),
+            'items': await Future.wait(items.map((item) async => {
+                  'productId': await _lookupUuid('products', item.productId),
+                  'productName': item.productName,
+                  'quantity': item.quantity,
+                  'unit': item.unit,
+                  'unitCost': item.unitCost,
+                  'gstRate': item.gstRate,
+                  'gstAmount': item.gstAmount,
+                  'totalCost': item.totalCost,
+                  'batchNumber': item.batchNumber,
+                  'expiryDate': item.expiryDate?.toIso8601String().substring(0, 10),
+                })),
+          },
+          options: Options(headers: headers),
+        );
+        return response.data ?? <String, dynamic>{};
+      });
+      final purchaseId = await _registerUuid('purchases', clientRecordId);
+      return Purchase(
+        id: purchaseId,
+        purchaseNumber: purchaseNumber,
+        supplierId: supplierId,
+        supplierName: supplierName,
+        items: items
+            .map((item) => PurchaseItem(
+                  purchaseId: purchaseId,
+                  productId: item.productId,
+                  productName: item.productName,
+                  quantity: item.quantity,
+                  unit: item.unit,
+                  unitCost: item.unitCost,
+                  gstRate: item.gstRate,
+                  gstAmount: item.gstAmount,
+                  totalCost: item.totalCost.abs(),
+                ))
+            .toList(),
+        totalAmount: total,
+        gstTotal: gstTotal,
+        paymentMode: paymentMode,
+        notes: notes,
+        purchaseDate: date,
+        createdAt: now,
+      );
+    }
+    final db = await _db.database;
+    final now = DateTime.now();
+    final nowStr = now.toIso8601String();
+    final date = purchaseDate ?? now;
+
+    final computedTotal = items.fold(0.0, (s, i) => s + i.totalCost.abs());
+    double total =
+        (invoiceAmount != null && invoiceAmount > 0) ? invoiceAmount : computedTotal;
+    double gstTotal = items.fold(0.0, (s, i) => s + i.gstAmount);
+
+    // IMPORTANT: resolve licenseId BEFORE the transaction to prevent sqflite
+    // deadlock — resolveLicenseId opens the main DB connection, which conflicts
+    // with the exclusive lock held by db.transaction().
+    final licenseId = await LedgerService.resolveLicenseId(_db);
+
+    final purchase = await db.transaction((txn) async {
+      final purchaseId = await txn.insert('purchases', {
+        'purchase_number': _genNumber(), 'supplier_id': supplierId,
+        'supplier_name': supplierName, 'total_amount': total, 'gst_total': gstTotal,
+        'discount_amount': 0, 'payment_mode': paymentMode, 'notes': notes,
+        'purchase_date': date.toIso8601String(), 'created_at': nowStr,
+      });
+
+      final purchaseItems = <PurchaseItem>[];
+      // Tracks the stock increment (in base units) per purchase line, indexed
+      // by position in purchaseItems.  Using a List (not a Map keyed by
+      // productId) ensures correctness when the same product appears more than
+      // once — e.g. two separate batches of the same item in a single invoice.
+      // This list is used to set the quantityChange on each ledger debit entry
+      // and to compute the aggregate quantity for the consolidated debit when
+      // GST rounding causes a drift between the per-item debit sum and the
+      // invoice credit total.
+      final List<double> itemBaseQties = [];
+
+      for (final item in items) {
+        final itemId = await txn.insert('purchase_items', {
+          'purchase_id': purchaseId, 'product_id': item.productId,
+          'product_name': item.productName, 'quantity': item.quantity,
+          'unit': item.unit, 'unit_cost': item.unitCost, 'gst_rate': item.gstRate,
+          'gst_amount': item.gstAmount, 'total_cost': item.totalCost,
+        });
+        // Update stock — convert wholesale units to retail units if configured,
+        // then convert to smallest base unit (g for Kg, ml for L) for storage.
+        final productRows = await txn.query('products',
+            columns: ['wholesale_to_retail_qty', 'unit'],
+            where: 'id = ?', whereArgs: [item.productId]);
+        final wholesaleToRetailQty = productRows.isNotEmpty
+            ? (productRows.first['wholesale_to_retail_qty'] as num?)?.toDouble() ?? 1.0
+            : 1.0;
+        final productUnit = productRows.isNotEmpty
+            ? productRows.first['unit'] as String? ?? 'piece'
+            : 'piece';
+        final productFactor = UomConversionHelper.baseFactor(productUnit);
+        // stockIncrement in user-facing units (after wholesale→retail conversion)
+        final stockIncrementUser = wholesaleToRetailQty > 1.0
+            ? item.quantity * wholesaleToRetailQty
+            : item.quantity;
+        // Convert to base units for DB storage
+        final stockIncrement = stockIncrementUser * productFactor;
+        await txn.rawUpdate('UPDATE products SET stock_quantity = stock_quantity + ?, updated_at = ? WHERE id = ?',
+            [stockIncrement, nowStr, item.productId]);
+        // Update purchase price to the latest cost for this product
+        await txn.rawUpdate('UPDATE products SET purchase_price = ?, updated_at = ? WHERE id = ?',
+            [item.unitCost, nowStr, item.productId]);
+
+        // ── Batch entry for FEFO tracking ─────────────────────────────────
+        // Each purchase line creates exactly one new batch row — batches are
+        // NEVER merged automatically even when the same product is purchased
+        // multiple times in a single invoice (e.g. different batch numbers or
+        // expiry dates).  Billing drains qty_remaining from the batch with the
+        // earliest expiry_date first (FEFO).  Storing unit_cost per batch
+        // enables accurate cost-of-goods-sold (COGS) calculation at sale time.
+        await txn.insert('batches', {
+          'product_id': item.productId,
+          'purchase_id': purchaseId,
+          'batch_number': item.batchNumber,
+          'expiry_date': item.expiryDate?.toIso8601String().substring(0, 10),
+          'qty_in': stockIncrement,
+          'qty_remaining': stockIncrement,
+          'unit_cost': item.unitCost,
+          'created_at': nowStr,
+          'updated_at': nowStr,
+        });
+
+        // Record base qty for this line; index matches purchaseItems list below
+        itemBaseQties.add(stockIncrement);
+        purchaseItems.add(PurchaseItem(id: itemId, purchaseId: purchaseId,
+            productId: item.productId, productName: item.productName,
+            quantity: item.quantity, unit: item.unit, unitCost: item.unitCost,
+            gstRate: item.gstRate, gstAmount: item.gstAmount, totalCost: item.totalCost.abs()));
+      }
+
+      // ── Double-entry ledger ─────────────────────────────────────────────
+      // Purchase journal:
+      //   DR Inventory   total (stock in — consolidated to match credit exactly)
+      //   CR Asset/Liability   total (cash paid or credit payable)
+      //
+      // ATOMICITY: no try/catch — ledger failure rolls back the whole
+      // transaction (purchase record + items + stock updates + batches).
+      final ledger = LedgerService.instance;
+      final creditType = paymentMode == 'credit' ? 'liability' : 'asset';
+
+      // Build per-item debit entries using per-line base quantities so that
+      // duplicate products (different batches) each get the correct quantity.
+      // If the debit sum mismatches total due to GST rounding, collapse into a
+      // single consolidated debit for balance.
+      final ledgerEntries = <LedgerEntryInput>[];
+      for (int i = 0; i < purchaseItems.length; i++) {
+        ledgerEntries.add(LedgerEntryInput(
+          accountType: 'inventory', direction: 'debit',
+          amount: purchaseItems[i].totalCost.abs(),
+          quantityChange: itemBaseQties[i],
+        ));
+      }
+      // CR asset/liability = full invoice total
+      ledgerEntries.add(LedgerEntryInput(
+        accountType: creditType, direction: 'credit', amount: total,
+      ));
+
+      // Collapse debit side if rounding drift > 0.5 paisa
+      final debitSum = ledgerEntries
+          .where((e) => e.direction == 'debit')
+          .fold(0.0, (s, e) => s + e.amount);
+      if ((debitSum - total).abs() > 0.005) {
+        final totalBaseQty = itemBaseQties.fold(0.0, (s, q) => s + q);
+        ledgerEntries.removeWhere((e) => e.direction == 'debit');
+        ledgerEntries.add(LedgerEntryInput(
+          accountType: 'inventory', direction: 'debit',
+          amount: total, quantityChange: totalBaseQty,
+        ));
+      }
+
+      await ledger.recordTransaction(
+        executor: txn,
+        type: 'purchase',
+        totalAmount: total,
+        tags: {
+          'purchase_id': purchaseId,
+          'supplier_name': supplierName,
+          'payment_mode': paymentMode,
+          'invoice_number': invoiceNumber,
+          'invoice_amount': invoiceAmount,
+          'notes': notes,
+        },
+        licenseId: licenseId,
+        createdAt: nowStr,
+        entries: ledgerEntries,
+      );
+
+      return Purchase(id: purchaseId, purchaseNumber: 'PUR-$purchaseId',
+          supplierId: supplierId, supplierName: supplierName, items: purchaseItems,
+          totalAmount: total, gstTotal: gstTotal, paymentMode: paymentMode,
+          notes: notes, purchaseDate: date, createdAt: now);
+    });
+
+    return purchase;
+  }
+
+  Future<List<Purchase>> getRecentPurchases({int limit = 50}) async {
+    if (await _isOnlineMode()) {
+      final body = await BackendApiService.instance.withAuthRetry<Map<String, dynamic>>((
+        dio,
+        headers,
+      ) async {
+        final response = await dio.get<Map<String, dynamic>>(
+          'purchases',
+          queryParameters: {'limit': limit},
+          options: Options(headers: headers),
+        );
+        return response.data ?? <String, dynamic>{};
+      });
+      final purchases = <Purchase>[];
+      for (final raw in ((body['purchases'] as List?) ?? const <dynamic>[]).whereType<Map>()) {
+        final row = Map<String, dynamic>.from(raw);
+        final createdAt = DateTime.tryParse(
+              (row['createdAt'] ?? row['created_at'] ?? '').toString(),
+            ) ??
+            DateTime.now();
+        purchases.add(
+          Purchase(
+            id: await _registerUuid(
+              'purchases',
+              (row['clientRecordId'] ?? row['client_record_id'] ?? row['serverId'])
+                  ?.toString(),
+            ),
+            purchaseNumber:
+                (row['purchaseNumber'] ?? row['purchase_number'] ?? '').toString(),
+            supplierName:
+                row['supplierName']?.toString() ?? row['supplier_name']?.toString(),
+            items: const <PurchaseItem>[],
+            totalAmount: ((row['totalAmount'] ?? row['total_amount']) as num?)
+                    ?.toDouble() ??
+                0.0,
+            gstTotal:
+                ((row['gstTotal'] ?? row['gst_total']) as num?)?.toDouble() ?? 0.0,
+            paymentMode:
+                (row['paymentMode'] ?? row['payment_mode'] ?? 'cash').toString(),
+            notes: row['notes']?.toString(),
+            purchaseDate: DateTime.tryParse(
+                  (row['purchaseDate'] ?? row['purchase_date'] ?? '').toString(),
+                ) ??
+                createdAt,
+            createdAt: createdAt,
+          ),
+        );
+      }
+      return purchases;
+    }
+    final db = await _db.database;
+    final rows = await db.query('purchases', orderBy: 'created_at DESC', limit: limit);
+    final purchases = <Purchase>[];
+    for (final row in rows) {
+      final items = await db.query('purchase_items', where: 'purchase_id=?', whereArgs: [row['id']]);
+      purchases.add(Purchase.fromMap(row, items.map((i) => PurchaseItem.fromMap(i)).toList()));
+    }
+    return purchases;
+  }
+}
+
+// ─── Events + States + BLoC ────────────────────────────────────────────────────
+abstract class PurchaseEvent extends Equatable { @override List<Object?> get props => []; }
+class LoadPurchases extends PurchaseEvent {}
+class SavePurchaseEvent extends PurchaseEvent {
+  final List<PurchaseCartItem> items;
+  final int? supplierId; final String? supplierName;
+  final double? invoiceAmount; final String? invoiceNumber;
+  final String paymentMode; final String? notes; final DateTime? purchaseDate;
+  SavePurchaseEvent({required this.items, this.supplierId, this.supplierName,
+    this.invoiceAmount, this.invoiceNumber,
+    this.paymentMode = 'cash', this.notes, this.purchaseDate});
+  @override List<Object?> get props => [items];
+}
+
+class PurchaseState extends Equatable {
+  final List<Purchase> purchases;
+  final bool isLoading; final bool isSaving; final String? error; final Purchase? lastSaved;
+  const PurchaseState({this.purchases = const [], this.isLoading = false,
+    this.isSaving = false, this.error, this.lastSaved});
+  PurchaseState copyWith({List<Purchase>? purchases, bool? isLoading, bool? isSaving, String? error, Purchase? lastSaved}) =>
+      PurchaseState(purchases: purchases ?? this.purchases, isLoading: isLoading ?? this.isLoading,
+          isSaving: isSaving ?? this.isSaving, error: error, lastSaved: lastSaved ?? this.lastSaved);
+  @override List<Object?> get props => [purchases, isLoading, isSaving, lastSaved];
+}
+
+class PurchaseBloc extends Bloc<PurchaseEvent, PurchaseState> {
+  final PurchaseRepository _repo;
+  PurchaseBloc(this._repo) : super(const PurchaseState()) {
+    on<LoadPurchases>(_onLoad);
+    on<SavePurchaseEvent>(_onSave);
+  }
+
+  Future<void> _onLoad(LoadPurchases e, Emitter<PurchaseState> emit) async {
+    emit(state.copyWith(isLoading: true));
+    try {
+      final purchases = await _repo.getRecentPurchases();
+      emit(state.copyWith(purchases: purchases, isLoading: false));
+    } catch (err) { emit(state.copyWith(isLoading: false, error: err.toString())); }
+  }
+
+  Future<void> _onSave(SavePurchaseEvent e, Emitter<PurchaseState> emit) async {
+    emit(state.copyWith(isSaving: true));
+    try {
+      final purchase = await _repo.savePurchase(items: e.items, supplierId: e.supplierId,
+          supplierName: e.supplierName, paymentMode: e.paymentMode,
+          invoiceAmount: e.invoiceAmount, invoiceNumber: e.invoiceNumber,
+          notes: e.notes, purchaseDate: e.purchaseDate);
+      emit(state.copyWith(isSaving: false, lastSaved: purchase));
+      add(LoadPurchases());
+    } catch (err) { emit(state.copyWith(isSaving: false, error: err.toString())); }
+  }
+}

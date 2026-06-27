@@ -1,0 +1,46 @@
+{
+  "nav": {
+    "features": "Features",
+    "demo": "Demo",
+    "pricing": "Pricing",
+    "download": "Download",
+    "faq": "FAQ",
+    "startTrial": "Start Free Trial",
+    "downloadApk": "Download APK"
+  },
+  "hero": {
+    "badge": "🚀 New — v2.0 Now Available",
+    "headline": "The POS That Works Everywhere — Web, Mobile & Offline",
+    "subheadline": "Lightning-fast billing, GST-ready invoices, and UPI payments built for modern Indian businesses.",
+    "startTrial": "Start Free Trial",
+    "watchDemo": "Watch 2-min Demo",
+    "downloadApk": "Download APK",
+    "trustedBy": "Trusted by 5,000+ businesses"
+  },
+  "features": {
+    "title": "Built for every kind of business",
+    "subtitle": "Web POS for the counter. Mobile POS for the floor.",
+    "webPos": "Web POS",
+    "mobilePos": "Mobile POS",
+    "backOffice": "Back Office"
+  },
+  "pricing": {
+    "title": "Simple, transparent pricing",
+    "subtitle": "No hidden fees. Cancel anytime.",
+    "monthly": "Monthly",
+    "yearly": "Yearly",
+    "save": "Save 20%"
+  },
+  "faq": {
+    "title": "Answers to your questions",
+    "searchPlaceholder": "Search FAQs..."
+  },
+  "download": {
+    "title": "Download NammaNanban Mobile POS",
+    "subtitle": "Free to install. Works offline. No subscription needed.",
+    "cta": "Download APK →",
+    "version": "Version 2.0.1",
+    "size": "28 MB",
+    "androidMin": "Android 7.0+"
+  }
+}

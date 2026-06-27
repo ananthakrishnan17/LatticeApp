@@ -1,0 +1,5 @@
+app:
+  jwt:
+    issuer: nammanban-pos-test
+    secret: test-only-secret-key-for-builds-and-local-tests-with-extra-length-2026
+    access-token-minutes: 60

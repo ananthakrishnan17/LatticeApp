@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NammaNanaban Admin</title>
+  <link rel="stylesheet" href="assets/styles.css" />
+</head>
+<body>
+  <main class="container card admin-panel">
+    <h1>Admin Content Control</h1>
+    <p>Update website content and secure links below.</p>
+    <form id="adminForm">
+      <label>Hero Title<input type="text" id="heroTitle" required /></label>
+      <label>Hero Subtitle<textarea id="heroSubtitle" rows="2" required></textarea></label>
+      <label>Contact Number<input type="text" id="contactNumber" required /></label>
+      <label>APK Access Link
+        <select id="apkOption">
+          <option value="none">Disabled</option>
+          <option value="standard">Standard APK download</option>
+        </select>
+      </label>
+      <label>Cloud POS Route
+        <select id="posOption">
+          <option value="none">Disabled</option>
+          <option value="production">Production Cloud POS</option>
+        </select>
+      </label>
+      <label>SEO Description<textarea id="seoDescription" rows="2" required></textarea></label>
+      <label>SEO Keywords<input type="text" id="seoKeywords" required /></label>
+      <button type="submit">Save Settings</button>
+    </form>
+    <p id="saveStatus" aria-live="polite"></p>
+    <p><a href="index.html">Back to visitor page</a></p>
+  </main>
+
+  <script src="assets/admin.js"></script>
+</body>
+</html>

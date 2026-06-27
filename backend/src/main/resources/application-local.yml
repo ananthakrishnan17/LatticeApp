@@ -1,0 +1,12 @@
+spring:
+  config:
+    activate:
+      on-profile: local
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/nammanban}
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:postgres}
+app:
+  jwt:
+    # Local-only fallback. Always override with JWT_SECRET outside local development.
+    secret: ${JWT_SECRET:0123456789abcdef0123456789abcdef}
