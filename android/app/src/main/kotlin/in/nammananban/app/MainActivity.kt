@@ -1,4 +1,4 @@
-package com.example.voiceresearch
+package `in`.nammananban.app
 
 import io.flutter.embedding.android.FlutterActivity
 
